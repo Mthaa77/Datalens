@@ -1,0 +1,6 @@
+{
+  "name": "CivicLens SA",
+  "description": "A South African civic intelligence platform exploring municipal financial health, audits, tenders, and governance data linked to verified sources.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
