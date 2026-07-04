@@ -11,6 +11,9 @@ import {
   FinancialMetric,
   AuditOutcome
 } from "@/lib/fixtures";
+import { db } from "@/lib/firebase";
+import { collection, addDoc } from "firebase/firestore";
+
 
 // Keep a simple server-side cache for geographies to maximize response times
 let cachedGeographies: any[] | null = null;
@@ -408,6 +411,20 @@ export async function POST(req: NextRequest) {
         });
         const latency = Date.now() - startTime;
 
+        // Persist connection test to Firestore
+        try {
+          await addDoc(collection(db, "connection_tests"), {
+            timestamp,
+            sourceId: targetId,
+            status: "connected",
+            latencyMs: latency,
+            url,
+            error: ""
+          });
+        } catch (fError) {
+          console.error("Failed to write connection_tests to Firestore:", fError);
+        }
+
         return NextResponse.json({
           status: "connected",
           sourceId: targetId,
@@ -417,6 +434,20 @@ export async function POST(req: NextRequest) {
           timestamp
         });
       } catch (err: any) {
+        // Persist failed connection test to Firestore
+        try {
+          await addDoc(collection(db, "connection_tests"), {
+            timestamp,
+            sourceId: targetId,
+            status: "failed",
+            latencyMs: 0,
+            url,
+            error: err.message || "Connection timed out"
+          });
+        } catch (fError) {
+          console.error("Failed to write failed connection_tests to Firestore:", fError);
+        }
+
         return NextResponse.json({
           status: "failed",
           sourceId: targetId,
@@ -514,6 +545,19 @@ export async function POST(req: NextRequest) {
       }
 
       appendLog(`Ingestion cascade completed successfully. All data connections verified.`);
+
+      // Persist Ingestion Run to Firestore
+      try {
+        await addDoc(collection(db, "ingestion_logs"), {
+          timestamp,
+          sourceId: targetId,
+          logs,
+          success: true,
+          stats
+        });
+      } catch (fError) {
+        console.error("Failed to write ingestion_logs to Firestore:", fError);
+      }
 
       return NextResponse.json({
         success: true,

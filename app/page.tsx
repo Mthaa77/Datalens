@@ -43,6 +43,29 @@ import {
   Zap
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import { auth, db } from "@/lib/firebase";
+import { 
+  onAuthStateChanged, 
+  signInWithPopup, 
+  GoogleAuthProvider, 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword,
+  signOut 
+} from "firebase/auth";
+import { 
+  doc, 
+  getDoc, 
+  setDoc, 
+  updateDoc, 
+  serverTimestamp,
+  collection,
+  query,
+  where,
+  orderBy,
+  limit,
+  onSnapshot,
+  addDoc
+} from "firebase/firestore";
 import { 
   municipalitiesList, 
   financialMetricsData, 
@@ -60,6 +83,7 @@ import {
   ElectionResult,
   WardData
 } from "@/lib/fixtures";
+import CitizenAuditSimulator from "@/components/CitizenAuditSimulator";
 import {
   ResponsiveContainer,
   BarChart,
@@ -305,37 +329,129 @@ export default function CivicLensDashboard() {
   const [showAuthModal, setShowAuthModal] = useState<boolean>(false);
   const [authEmail, setAuthEmail] = useState<string>("");
   const [authPassword, setAuthPassword] = useState<string>("");
+  const [authError, setAuthError] = useState<string>("");
   
-  // Watchlist stored locally
-  const [watchlist, setWatchlist] = useState<string[]>([]);
+  // Watchlist
+  const [watchlist, setWatchlist] = useState<string[]>(["TSH"]);
   const [subscribedAlerts, setSubscribedAlerts] = useState<Record<string, boolean>>({
     "TSH_audit": true,
     "TSH_tender": false,
     "JHB_audit": true
   });
 
-  // Load auth & watchlist from localStorage after component mounts on the client
+  // Load auth & watchlist from live Firestore database (with data sovereignty in africa-south1)
   useEffect(() => {
-    const email = localStorage.getItem("civiclens_email");
-    const stored = localStorage.getItem("civiclens_watchlist");
-
-    Promise.resolve().then(() => {
-      if (email) {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
         setIsLoggedIn(true);
-        setUserEmail(email);
-      }
-
-      if (stored) {
+        setUserEmail(firebaseUser.email || "user@civiclens.co.za");
+        
         try {
-          setWatchlist(JSON.parse(stored));
-        } catch (e) {
-          console.error("Failed to parse stored watchlist", e);
-          setWatchlist(["TSH"]);
+          const userRef = doc(db, "users", firebaseUser.uid);
+          const userDoc = await getDoc(userRef);
+          
+          if (userDoc.exists()) {
+            const data = userDoc.data();
+            if (data.watchlist) setWatchlist(data.watchlist);
+            if (data.subscribedAlerts) setSubscribedAlerts(data.subscribedAlerts);
+          } else {
+            // First time login - provision default profile document in africa-south1
+            const initialProfile = {
+              email: firebaseUser.email || "",
+              watchlist: ["TSH"],
+              subscribedAlerts: {
+                "TSH_audit": true,
+                "TSH_tender": false,
+                "JHB_audit": true
+              },
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp()
+            };
+            await setDoc(userRef, initialProfile);
+            setWatchlist(["TSH"]);
+          }
+        } catch (err) {
+          console.error("Error synchronizing with Firestore user profile:", err);
         }
       } else {
-        setWatchlist(["TSH"]);
+        setIsLoggedIn(false);
+        setUserEmail("guest@civiclens.co.za");
+        
+        // Fallback to local storage for guests
+        const stored = localStorage.getItem("civiclens_watchlist");
+        if (stored) {
+          try {
+            setWatchlist(JSON.parse(stored));
+          } catch {
+            setWatchlist(["TSH"]);
+          }
+        } else {
+          setWatchlist(["TSH"]);
+        }
       }
     });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Citizen Watchdog Flagging States
+  const [flaggedTenders, setFlaggedTenders] = useState<any[]>([]);
+  const [flaggingTender, setFlaggingTender] = useState<any | null>(null);
+  const [flagReason, setFlagReason] = useState<string>("Overpriced / Suspicious Value");
+  const [flagComment, setFlagComment] = useState<string>("");
+  const [isSubmittingFlag, setIsSubmittingFlag] = useState<boolean>(false);
+  const [flagSuccess, setFlagSuccess] = useState<boolean>(false);
+
+  // Subscribe to real-time flagged tenders for selected municipality
+  useEffect(() => {
+    const q = query(
+      collection(db, "flagged_tenders"),
+      where("muniCode", "==", selectedMuniCode),
+      orderBy("timestamp", "desc")
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const docs: any[] = [];
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        docs.push({
+          id: doc.id,
+          ...data
+        });
+      });
+      setFlaggedTenders(docs);
+    }, (error) => {
+      console.error("Error loading flagged tenders:", error);
+    });
+
+    return () => unsubscribe();
+  }, [selectedMuniCode]);
+
+  // Historical Ingestion Logs from Firestore
+  const [historyLogs, setHistoryLogs] = useState<any[]>([]);
+
+  useEffect(() => {
+    const q = query(
+      collection(db, "ingestion_logs"),
+      orderBy("timestamp", "desc"),
+      limit(5)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const docs: any[] = [];
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        docs.push({
+          id: doc.id,
+          ...data
+        });
+      });
+      setHistoryLogs(docs);
+    }, (error) => {
+      console.error("Error loading historical ingestion logs:", error);
+    });
+
+    return () => unsubscribe();
   }, []);
 
   // Tender filters
@@ -503,25 +619,87 @@ export default function CivicLensDashboard() {
     }
   };
 
-  // Handle Auth Mock Submit
-  const handleAuthSubmit = (e: React.FormEvent) => {
+  // Submit tender watchdog flag to Firestore
+  const submitTenderFlag = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (authEmail.includes("@")) {
-      setIsLoggedIn(true);
-      setUserEmail(authEmail);
-      localStorage.setItem("civiclens_email", authEmail);
-      setShowAuthModal(false);
+    if (!flaggingTender) return;
+    setIsSubmittingFlag(true);
+    setFlagSuccess(false);
+
+    try {
+      await addDoc(collection(db, "flagged_tenders"), {
+        tenderId: flaggingTender.id,
+        tenderTitle: flaggingTender.title,
+        issuingEntity: flaggingTender.issuingEntity,
+        muniCode: selectedMuniCode,
+        reason: flagReason,
+        comment: flagComment,
+        citizenEmail: userEmail,
+        timestamp: serverTimestamp()
+      });
+      setFlagSuccess(true);
+      setFlagComment("");
+      setTimeout(() => {
+        setFlaggingTender(null);
+        setFlagSuccess(false);
+      }, 2000);
+    } catch (err) {
+      console.error("Failed to submit tender watchdog flag:", err);
+    } finally {
+      setIsSubmittingFlag(false);
     }
   };
 
-  const handleSignOut = () => {
-    setIsLoggedIn(false);
-    setUserEmail("guest@civiclens.co.za");
-    localStorage.removeItem("civiclens_email");
+  // Handle Auth with Firebase Auth (supporting standard Email/Password and Google Sign-In)
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    try {
+      // First try to sign in
+      try {
+        await signInWithEmailAndPassword(auth, authEmail, authPassword);
+        setShowAuthModal(false);
+      } catch (err: any) {
+        // If user doesn't exist, automatically sign them up! Extremely smooth developer/user experience
+        if (err.code === "auth/user-not-found" || err.code === "auth/invalid-credential" || err.message.includes("not-found") || err.message.includes("credential")) {
+          try {
+            await createUserWithEmailAndPassword(auth, authEmail, authPassword);
+            setShowAuthModal(false);
+          } catch (signUpErr: any) {
+            setAuthError(signUpErr.message || "Failed to create new sovereign user profile.");
+          }
+        } else {
+          setAuthError(err.message);
+        }
+      }
+    } catch (err: any) {
+      setAuthError(err.message || "Authentication error encountered.");
+    }
   };
 
-  // Toggle watchlist
-  const toggleWatchlist = (code: string) => {
+  const handleGoogleSignIn = async () => {
+    setAuthError("");
+    try {
+      const provider = new GoogleAuthProvider();
+      await signInWithPopup(auth, provider);
+      setShowAuthModal(false);
+    } catch (err: any) {
+      setAuthError(err.message || "Google Authentication aborted or blocked by iframe restrictions.");
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth);
+      setIsLoggedIn(false);
+      setUserEmail("guest@civiclens.co.za");
+    } catch (err) {
+      console.error("Sign-out error:", err);
+    }
+  };
+
+  // Toggle watchlist (persisted in africa-south1 Firestore for authenticated users)
+  const toggleWatchlist = async (code: string) => {
     let updated = [...watchlist];
     if (updated.includes(code)) {
       updated = updated.filter(c => c !== code);
@@ -530,14 +708,39 @@ export default function CivicLensDashboard() {
     }
     setWatchlist(updated);
     localStorage.setItem("civiclens_watchlist", JSON.stringify(updated));
+
+    if (isLoggedIn && auth.currentUser) {
+      try {
+        const userRef = doc(db, "users", auth.currentUser.uid);
+        await updateDoc(userRef, {
+          watchlist: updated,
+          updatedAt: serverTimestamp()
+        });
+      } catch (err) {
+        console.error("Failed to update watchlist in sovereign Firestore:", err);
+      }
+    }
   };
 
-  // Toggle Alerts
-  const toggleAlert = (key: string) => {
-    setSubscribedAlerts(prev => ({
-      ...prev,
-      [key]: !prev[key]
-    }));
+  // Toggle Alerts (persisted in africa-south1 Firestore for authenticated users)
+  const toggleAlert = async (key: string) => {
+    const updatedAlerts = {
+      ...subscribedAlerts,
+      [key]: !subscribedAlerts[key]
+    };
+    setSubscribedAlerts(updatedAlerts);
+
+    if (isLoggedIn && auth.currentUser) {
+      try {
+        const userRef = doc(db, "users", auth.currentUser.uid);
+        await updateDoc(userRef, {
+          subscribedAlerts: updatedAlerts,
+          updatedAt: serverTimestamp()
+        });
+      } catch (err) {
+        console.error("Failed to update alert in sovereign Firestore:", err);
+      }
+    }
   };
 
   // Run AI Summary using the Next.js server proxy API
@@ -1844,15 +2047,25 @@ export default function CivicLensDashboard() {
                         <span>Closing Date: <strong className="text-rose-400">{formatDate(tender.closingAt)}</strong></span>
                       </div>
 
-                      <a 
-                        href={tender.sourceUrl} 
-                        target="_blank" 
-                        rel="noreferrer"
-                        className="text-indigo-400 hover:text-indigo-300 inline-flex items-center gap-1 font-semibold hover:underline cursor-pointer"
-                      >
-                        Official Download
-                        <ExternalLink className="w-3.5 h-3.5" />
-                      </a>
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={() => setFlaggingTender(tender)}
+                          className="text-rose-400 hover:text-rose-300 inline-flex items-center gap-1 font-semibold hover:underline cursor-pointer border border-rose-500/10 hover:border-rose-500/20 bg-rose-500/5 px-3 py-1.5 rounded-xl transition-colors text-xs"
+                        >
+                          <ShieldAlert className="w-3.5 h-3.5" />
+                          Flag Tender
+                        </button>
+
+                        <a 
+                          href={tender.sourceUrl} 
+                          target="_blank" 
+                          rel="noreferrer"
+                          className="text-indigo-400 hover:text-indigo-300 inline-flex items-center gap-1 font-semibold hover:underline cursor-pointer border border-indigo-500/10 hover:border-indigo-500/20 bg-indigo-500/5 px-3 py-1.5 rounded-xl transition-colors text-xs"
+                        >
+                          Official Download
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </a>
+                      </div>
                     </div>
                   </div>
                 ))
@@ -1863,6 +2076,163 @@ export default function CivicLensDashboard() {
                 </div>
               )}
             </div>
+
+            {/* CITIZEN WATCHDOG FLAGGED PROCUREMENT BOARD (database-backed truth tracker) */}
+            <div className="glass p-6 shadow-xl text-left space-y-6 bg-slate-950/20 border border-white/10 rounded-3xl mt-8">
+              <div>
+                <span className="text-xs font-mono text-rose-400 bg-rose-500/10 px-2.5 py-1 rounded-full font-bold uppercase border border-rose-500/20">
+                  Citizen Watchdog Registry
+                </span>
+                <h4 className="text-lg font-bold font-display text-white mt-2 flex items-center gap-2">
+                  <ShieldAlert className="w-5 h-5 text-rose-400" />
+                  Sovereign Citizen Procurement Alerts ({flaggedTenders.length})
+                </h4>
+                <p className="text-xs text-slate-300 mt-1">
+                  Procurement bids flagged for audit review by other South African citizens in {selectedMuni.name}. Watchdogs act as localized auditing sensors.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {flaggedTenders.length > 0 ? (
+                  flaggedTenders.map((alert) => (
+                    <div key={alert.id} className="p-4 bg-slate-950/40 rounded-2xl border border-white/5 space-y-3 flex flex-col justify-between hover:border-rose-500/20 transition-all text-xs">
+                      <div className="space-y-1.5">
+                        <div className="flex justify-between items-start gap-2">
+                          <span className="font-mono text-[10px] font-bold text-slate-400 truncate max-w-[150px]">
+                            {alert.tenderId}
+                          </span>
+                          <span className="bg-rose-500/15 text-rose-300 text-[8px] font-mono font-bold px-2 py-0.5 rounded uppercase border border-rose-500/25 shrink-0">
+                            PENDING AUDIT
+                          </span>
+                        </div>
+                        <h5 className="text-white font-bold text-sm leading-tight line-clamp-1">
+                          {alert.tenderTitle}
+                        </h5>
+                        <p className="text-slate-300 italic bg-white/5 p-2.5 rounded-lg border border-white/5 text-[11px] leading-relaxed">
+                          &ldquo;{alert.comment || "No specific comment was provided by the citizen watchdog."}&rdquo;
+                        </p>
+                      </div>
+
+                      <div className="text-[10px] text-slate-400 font-mono flex justify-between items-center pt-2.5 border-t border-white/5">
+                        <span>Flag: <strong className="text-rose-300">{alert.reason}</strong></span>
+                        <span>{alert.citizenEmail ? alert.citizenEmail.split("@")[0] : "Citizen"}</span>
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="p-8 text-center text-slate-500 text-xs border border-dashed border-white/5 rounded-2xl md:col-span-2">
+                    No procurement alerts flagged in {selectedMuni.name} yet. Review active bids above and flag any suspicious entries.
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* CONDITIONAL FLAGGING MODAL */}
+            <AnimatePresence>
+              {flaggingTender && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-sm">
+                  <motion.div 
+                    initial={{ scale: 0.95, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    exit={{ scale: 0.95, opacity: 0 }}
+                    className="w-full max-w-lg bg-[#0e1525] border border-white/10 rounded-3xl p-6 shadow-2xl text-left space-y-6"
+                  >
+                    <div className="flex items-center justify-between border-b border-white/5 pb-3">
+                      <div className="flex items-center gap-2">
+                        <span className="p-1.5 bg-rose-500/10 rounded-lg text-rose-400 border border-rose-500/20">
+                          <ShieldAlert className="w-5 h-5" />
+                        </span>
+                        <div>
+                          <h4 className="text-sm font-bold text-white">Sovereign Watchdog Flag</h4>
+                          <p className="text-[10px] text-slate-400 font-mono">Tender ID: {flaggingTender.id}</p>
+                        </div>
+                      </div>
+                      <button 
+                        onClick={() => setFlaggingTender(null)}
+                        className="text-slate-400 hover:text-white transition-colors font-bold text-lg p-1"
+                      >
+                        &times;
+                      </button>
+                    </div>
+
+                    <div className="p-3.5 bg-rose-500/10 border border-rose-500/20 rounded-xl text-xs text-rose-200 space-y-1">
+                      <span className="font-bold text-white block">Audit Integrity Protocols:</span>
+                      <p className="leading-relaxed text-[11px]">
+                        You are submitting a citizen alert concerning public procurement. All watchdogs register their identity profile for traceability and database sovereignty.
+                      </p>
+                    </div>
+
+                    <form onSubmit={submitTenderFlag} className="space-y-4">
+                      <div>
+                        <label className="block text-[10px] font-bold font-mono uppercase text-slate-400 mb-1.5">Tender Title</label>
+                        <div className="p-3 bg-white/5 border border-white/5 rounded-xl text-xs text-white leading-relaxed">
+                          {flaggingTender.title}
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] font-bold font-mono uppercase text-slate-400 mb-1.5">Flag Category</label>
+                        <select 
+                          value={flagReason}
+                          onChange={(e) => setFlagReason(e.target.value)}
+                          className="w-full bg-slate-900/80 border border-white/10 text-white text-xs rounded-xl p-2.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono cursor-pointer [&>option]:bg-[#131a26]"
+                        >
+                          <option value="Overpriced / Suspicious Value">Overpriced / Suspicious Value</option>
+                          <option value="Conflict of Interest / Officials">Conflict of Interest / Officials</option>
+                          <option value="Unclear Scope / General Description">Unclear Scope / General Description</option>
+                          <option value="Inadequate Competition / Single Bidder">Inadequate Competition / Single Bidder</option>
+                          <option value="Suspicious Awardee History">Suspicious Awardee History</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] font-bold font-mono uppercase text-slate-400 mb-1.5">Provide Audit Rationale (Audit Evidence/Comment)</label>
+                        <textarea 
+                          placeholder="e.g., A R120M ERP deployment in a local category B municipality is roughly 3x average national procurement benchmarks..."
+                          value={flagComment}
+                          onChange={(e) => setFlagComment(e.target.value)}
+                          required
+                          rows={3}
+                          className="w-full bg-slate-900 border border-white/10 text-white text-xs rounded-xl p-3 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-sans resize-none"
+                        />
+                      </div>
+
+                      <div className="flex gap-3 pt-3 border-t border-white/5">
+                        <button
+                          type="button"
+                          onClick={() => setFlaggingTender(null)}
+                          className="flex-1 py-2 px-4 rounded-xl border border-white/10 text-slate-300 text-xs font-bold hover:bg-white/5 transition-all cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={isSubmittingFlag || !flagComment.trim()}
+                          className={`flex-1 py-2 px-4 rounded-xl text-xs font-bold text-white transition-all cursor-pointer ${
+                            isSubmittingFlag ? "bg-slate-800 text-slate-500 cursor-not-allowed" : "bg-rose-600 hover:bg-rose-500"
+                          }`}
+                        >
+                          {isSubmittingFlag ? "Submitting Alert..." : "Commit Watchdog Alert"}
+                        </button>
+                      </div>
+
+                      <AnimatePresence>
+                        {flagSuccess && (
+                          <motion.div 
+                            initial={{ opacity: 0, y: 5 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0 }}
+                            className="p-2.5 bg-emerald-500/15 border border-emerald-500/20 rounded-xl text-[10px] text-emerald-300 font-mono text-center"
+                          >
+                            ✔ Watchdog Alert published to national audit node.
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </form>
+                  </motion.div>
+                </div>
+              )}
+            </AnimatePresence>
 
           </div>
         )}
@@ -2001,6 +2371,12 @@ export default function CivicLensDashboard() {
               </div>
 
             </div>
+
+            {/* Premium Citizen Audit & Reallocation Simulator */}
+            <CitizenAuditSimulator 
+              municipality={selectedMuni} 
+              latestAudit={latestAudit} 
+            />
 
           </div>
         )}
@@ -2813,6 +3189,65 @@ export default function CivicLensDashboard() {
               </div>
             </div>
 
+            {/* Historical Ingestion Runs */}
+            <div className="glass p-6 sm:p-8 shadow-xl text-left bg-slate-950/25 border border-white/10 rounded-3xl">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-indigo-300 font-mono mb-4 flex items-center gap-1.5">
+                <Clock className="w-4 h-4 text-indigo-400" />
+                Pipeline Ingestion History & Audit Log ({historyLogs.length})
+              </h4>
+              <p className="text-xs text-slate-300 mb-6 leading-relaxed">
+                Review historical database sync cycles persisted to the sovereign Firestore cluster. This verifies the end-to-end data integrity cascade.
+              </p>
+
+              <div className="space-y-4">
+                {historyLogs.length > 0 ? (
+                  historyLogs.map((hLog) => (
+                    <div key={hLog.id} className="p-4 bg-slate-950/30 rounded-2xl border border-white/5 space-y-3">
+                      <div className="flex justify-between items-center border-b border-white/5 pb-2">
+                        <span className="text-[10px] font-mono text-indigo-400 font-bold">
+                          Run: {hLog.id.substring(0, 8)}...
+                        </span>
+                        <span className="text-[10px] font-mono text-slate-400">
+                          {hLog.timestamp ? new Date(hLog.timestamp.seconds * 1000).toLocaleString() : "Sync Complete"}
+                        </span>
+                      </div>
+                      
+                      {hLog.stats && (
+                        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-[10px] font-mono">
+                          {Object.entries(hLog.stats).map(([k, v]: [string, any]) => (
+                            <div key={k} className="bg-white/5 p-2 rounded-lg border border-white/5">
+                              <span className="text-slate-400 uppercase text-[8px] block">{k.replace("_", " ")}</span>
+                              <strong className={v.status === 'synced' ? "text-emerald-400" : "text-rose-400"}>
+                                {v.status === 'synced' ? `Synced` : `Failed`}
+                              </strong>
+                              {v.recordsChecked && (
+                                <span className="text-slate-400 block text-[8px] mt-0.5">{v.recordsChecked} items</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      <div className="text-[10px] text-slate-400 bg-slate-950/60 p-3 rounded-xl border border-white/5 space-y-1 max-h-32 overflow-y-auto font-mono">
+                        {(hLog.logs || []).slice(0, 3).map((line: string, lIdx: number) => (
+                          <div key={lIdx} className="text-slate-300 leading-relaxed truncate">{line}</div>
+                        ))}
+                        {(hLog.logs || []).length > 3 && (
+                          <div className="text-indigo-400 text-[9px] pt-1 font-semibold">
+                            + {(hLog.logs || []).length - 3} more log entries in Firestore trace...
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="p-10 text-center text-slate-500 border border-dashed border-white/5 rounded-2xl text-xs">
+                    No historical ingestion traces detected. Run an ingestion cycle above to record an audit trail to Firestore.
+                  </div>
+                )}
+              </div>
+            </div>
+
             {/* Indicator Calculation Explainer */}
             <div className="glass p-6 sm:p-8 shadow-xl text-left bg-slate-950/25 border border-white/10 rounded-3xl">
               <h4 className="text-xs font-bold uppercase tracking-wider text-indigo-300 font-mono mb-4 flex items-center gap-1.5">
@@ -2883,7 +3318,7 @@ export default function CivicLensDashboard() {
         )}
       </AnimatePresence>
 
-      {/* MODAL: MOCK AUTHENTICATION FORM */}
+      {/* MODAL: SOVEREIGN FIREBASE AUTHENTICATION */}
       {showAuthModal && (
         <div className="fixed inset-0 bg-slate-950/40 backdrop-blur-xs flex justify-center items-center z-50 p-4">
           <motion.div 
@@ -2893,11 +3328,17 @@ export default function CivicLensDashboard() {
           >
             <h3 className="text-lg font-bold font-display text-slate-900 flex items-center gap-2">
               <Lock className="w-5 h-5 text-emerald-600" />
-              Sign In to CivicLens SA
+              Sovereign Account Access
             </h3>
-            <p className="text-xs text-slate-500 mt-1">Register or access watchlists and alert warning triggers instantly.</p>
+            <p className="text-xs text-slate-500 mt-1">Access secure watchlists and custom alert configurations stored in Johannesburg (africa-south1).</p>
             
-            <form onSubmit={handleAuthSubmit} className="space-y-4 mt-5">
+            {authError && (
+              <div className="mt-3 p-2.5 bg-rose-50 border border-rose-100 text-rose-600 text-[11px] rounded-lg leading-snug font-mono max-h-24 overflow-y-auto">
+                {authError}
+              </div>
+            )}
+
+            <form onSubmit={handleAuthSubmit} className="space-y-4 mt-4">
               <div>
                 <label className="block text-xs font-bold font-mono uppercase text-slate-500 mb-1">Email Address</label>
                 <input 
@@ -2906,7 +3347,7 @@ export default function CivicLensDashboard() {
                   placeholder="e.g. tshepiso@civiclens.co.za"
                   value={authEmail}
                   onChange={(e) => setAuthEmail(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 p-2.5 text-xs rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  className="w-full bg-slate-50 border border-slate-200 p-2.5 text-xs rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 text-slate-900"
                 />
               </div>
 
@@ -2918,16 +3359,16 @@ export default function CivicLensDashboard() {
                   placeholder="••••••••"
                   value={authPassword}
                   onChange={(e) => setAuthPassword(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 p-2.5 text-xs rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  className="w-full bg-slate-50 border border-slate-200 p-2.5 text-xs rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 text-slate-900"
                 />
               </div>
 
-              <div className="flex gap-2 pt-2">
+              <div className="flex gap-2 pt-1">
                 <button 
                   type="submit"
                   className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs py-2.5 rounded-lg transition-colors cursor-pointer text-center"
                 >
-                  Verify Access
+                  Verify & Enter
                 </button>
                 <button 
                   type="button"
@@ -2937,6 +3378,23 @@ export default function CivicLensDashboard() {
                   Cancel
                 </button>
               </div>
+
+              <div className="relative my-4 flex items-center">
+                <div className="flex-grow border-t border-slate-200"></div>
+                <span className="flex-shrink mx-3 text-[10px] text-slate-400 font-mono uppercase font-bold">Or</span>
+                <div className="flex-grow border-t border-slate-200"></div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleGoogleSignIn}
+                className="w-full flex items-center justify-center gap-2 bg-slate-950 text-white font-bold text-xs py-2.5 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24">
+                  <path d="M12.24 10.285V14.4h6.887c-.648 2.41-2.519 4.114-5.136 4.114A5.87 5.87 0 018.12 12.64a5.87 5.87 0 015.871-5.871c1.54 0 2.94.593 4.002 1.558l3.125-3.125C19.23 3.38 16.78 2 13.99 2 8.474 2 4 6.474 4 12s4.474 10 9.99 10c5.753 0 10.01-4.043 10.01-10 0-.683-.082-1.336-.211-1.715H12.24z"/>
+                </svg>
+                Sign In with Google
+              </button>
             </form>
           </motion.div>
         </div>

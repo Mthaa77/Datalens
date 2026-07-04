@@ -1,0 +1,89 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for hardened security
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Default deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // User collection rules
+    match /users/{userId} {
+      // Validate user profile schema
+      function isValidUser(data) {
+        return data.email is string 
+          && data.email.size() > 3 
+          && data.email.size() <= 256
+          && data.watchlist is list
+          && data.watchlist.size() <= 100
+          && data.subscribedAlerts is map
+          && data.createdAt is timestamp
+          && data.updatedAt is timestamp;
+      }
+
+      // Profile is readable only by its owner
+      allow get: if isOwner(userId) && isValidId(userId);
+      // Deny listing to prevent email/profile scraping
+      allow list: if false;
+
+      // Create must be owned, verified, validated, and temporally synchronized
+      allow create: if isOwner(userId) 
+        && isValidId(userId)
+        && isValidUser(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && incoming().keys().hasAll(['email', 'watchlist', 'subscribedAlerts', 'createdAt', 'updatedAt'])
+        && incoming().keys().size() == 5;
+
+      // Update can modify watchlist or subscribedAlerts, but email and createdAt remain immutable
+      allow update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUser(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().email == existing().email
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['watchlist', 'subscribedAlerts', 'updatedAt'])
+        );
+
+      allow delete: if isOwner(userId) && isValidId(userId);
+    }
+
+    // Ingestion Logs collection rules
+    match /ingestion_logs/{logId} {
+      // Publicly/authenticated read-only for transparency
+      allow get, list: if isSignedIn() && isValidId(logId);
+      // Client-side writes are strictly forbidden
+      allow write: if false;
+    }
+
+    // Connection Tests collection rules
+    match /connection_tests/{testId} {
+      // Publicly/authenticated read-only for transparency
+      allow get, list: if isSignedIn() && isValidId(testId);
+      // Client-side writes are strictly forbidden
+      allow write: if false;
+    }
+  }
+}

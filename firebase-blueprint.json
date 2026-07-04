@@ -1,0 +1,98 @@
+{
+  "entities": {
+    "user": {
+      "title": "User Profile",
+      "description": "User account settings, watchlist, and alert subscriptions.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Primary email of the verified user."
+        },
+        "watchlist": {
+          "type": "array",
+          "description": "Array of municipality codes watched by this user."
+        },
+        "subscribedAlerts": {
+          "type": "object",
+          "description": "Map of alerts toggled for the watched municipalities."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["email", "watchlist", "subscribedAlerts", "createdAt", "updatedAt"]
+    },
+    "ingestionLog": {
+      "title": "Ingestion Log",
+      "description": "A record of an executed ingestion run.",
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "sourceId": {
+          "type": "string"
+        },
+        "logs": {
+          "type": "array"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "stats": {
+          "type": "object"
+        }
+      },
+      "required": ["timestamp", "sourceId", "logs", "success"]
+    },
+    "connectionTest": {
+      "title": "Connection Test",
+      "description": "Result of a tested live API source connection.",
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "sourceId": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "latencyMs": {
+          "type": "integer"
+        },
+        "url": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": ["timestamp", "sourceId", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "user",
+      "description": "User profile with watchlists and alerts."
+    },
+    "/ingestion_logs/{logId}": {
+      "schema": "ingestionLog",
+      "description": "Log of a background or manual data ingestion cascade."
+    },
+    "/connection_tests/{testId}": {
+      "schema": "connectionTest",
+      "description": "Durable record of checked external API services."
+    }
+  }
+}
